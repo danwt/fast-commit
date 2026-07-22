@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "requests",
+#     "truststore",
 # ]
 # ///
 
@@ -19,6 +20,12 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+import truststore
+
+# Verify TLS against the OS trust store. TLS-inspecting proxies install their
+# root CA there, and certifi's bundle does not have it.
+truststore.inject_into_ssl()
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
 LOGS_DIR = Path.home() / ".fastc" / "logs"
