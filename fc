@@ -463,7 +463,17 @@ def compute_path_context(file_paths):
 # Config + git helpers
 # ---------------------------------------------------------------------------
 
-def load_config():
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_CLAUDE = "claude"
+PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_CLAUDE)
+
+# Used when the config sets no CLAUDE_MODEL. Haiku is the cheapest model that
+# handles this task, and the claude provider spends a seat's Agent SDK credit
+# rather than metered API billing.
+CLAUDE_DEFAULT_MODEL = "haiku"
+
+
+def load_config(provider):
     if not CONFIG_PATH.exists():
         exit_with_error(
             f"config not found at {CONFIG_PATH}. Create it with OPENROUTER_API_KEY and MODEL",
@@ -476,10 +486,17 @@ def load_config():
             continue
         key, _, value = line.partition("=")
         config[key.strip()] = value.strip().strip("\"'")
-    if "OPENROUTER_API_KEY" not in config:
-        exit_with_error("OPENROUTER_API_KEY not set in config", {"config_path": str(CONFIG_PATH)})
-    if "MODEL" not in config:
-        exit_with_error("MODEL not set in config", {"config_path": str(CONFIG_PATH)})
+
+    config["PROVIDER"] = provider
+    if provider == PROVIDER_OPENROUTER:
+        if "OPENROUTER_API_KEY" not in config:
+            exit_with_error("OPENROUTER_API_KEY not set in config", {"config_path": str(CONFIG_PATH)})
+        if "MODEL" not in config:
+            exit_with_error("MODEL not set in config", {"config_path": str(CONFIG_PATH)})
+    else:
+        # MODEL is the one field the rest of the script reads for the model
+        # name, so the claude model lands there too.
+        config["MODEL"] = config.get("CLAUDE_MODEL", CLAUDE_DEFAULT_MODEL)
     return config
 
 
@@ -557,9 +574,14 @@ MAX_HUNKS_PER_FILE = 5
 # it avoids a full round-trip before any parallel work can start.
 LARGE_DIFF_FILES = 60
 MAX_OUTPUT_TOKENS = 8192
-# Cap on concurrent phase-2 LLM requests. These are pure I/O (HTTP), so the
-# cap exists only to protect OpenRouter from a single user hammering it.
-PHASE2_MAX_PARALLEL = 32
+# Cap on concurrent phase-2 LLM requests. Over HTTP these are pure I/O, so the
+# cap exists only to protect OpenRouter from a single user hammering it. Each
+# claude call is instead a CLI process holding ~450MB, so that cap is a memory
+# budget and has to be far lower.
+PHASE2_MAX_PARALLEL = {
+    PROVIDER_OPENROUTER: 32,
+    PROVIDER_CLAUDE: 4,
+}
 # Warn the user if a single LLM request takes longer than this many seconds.
 SLOW_LLM_THRESHOLD_S = 15.0
 # Beyond this many files, skip LLM entirely and use bulk commit
@@ -1038,17 +1060,17 @@ def try_repair_json(content):
     return None
 
 
-class _LLMWallClockTimeout(Exception):
-    pass
+class _LLMTransportError(Exception):
+    """A provider failure worth retrying."""
 
 
-def call_llm_raw(config, system_prompt, user_content, task_label=None):
-    """Make a streaming LLM API call and return parsed JSON.
+LLM_WALL_CLOCK_TIMEOUT_S = 90
 
-    Streams the response over SSE so we can record TTFB, let the spinner
-    show live "receiving" progress, and warn when a single request is
-    unusually slow. ``task_label`` is used in warning messages and logs so
-    it's obvious which group is slow.
+
+def _call_openrouter(config, system_prompt, user_content, start):
+    """POST to OpenRouter and read the SSE stream.
+
+    Returns (content, finish_reason, ttfb).
     """
     import requests
 
@@ -1066,15 +1088,8 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
-    wall_clock_timeout = 90
-    label = task_label or "llm"
-    content = ""
-    finish_reason = ""
-
-    for attempt in range(MAX_RETRIES):
-        start = time.monotonic()
-        _timings.request_started()
-        resp = None
+    resp = None
+    try:
         try:
             resp = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -1084,29 +1099,28 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
                     "Accept": "text/event-stream",
                 },
                 json=request_body,
-                timeout=(10, wall_clock_timeout),
+                timeout=(10, LLM_WALL_CLOCK_TIMEOUT_S),
                 stream=True,
             )
-            if resp.status_code != 200:
-                text = resp.text
-                if resp.status_code == 400 and "context length" in text.lower():
-                    _timings.request_finished(time.monotonic() - start)
-                    log("INFO", "LLM context length exceeded", {"response": text[:300]})
-                    raise ContextLengthExceeded(text[:500])
-                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
-                    _timings.request_finished(time.monotonic() - start)
-                    wait_time = 2 ** attempt
-                    warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                    time.sleep(wait_time)
-                    continue
-                _timings.request_finished(time.monotonic() - start)
-                exit_with_error(
-                    f"LLM API returned {resp.status_code}",
-                    {"status_code": resp.status_code, "response": text[:500], "model": config["MODEL"]}
-                )
+        except requests.exceptions.RequestException as e:
+            raise _LLMTransportError(str(e)) from e
 
-            ttfb = None
-            parts = []
+        if resp.status_code != 200:
+            text = resp.text
+            if resp.status_code == 400 and "context length" in text.lower():
+                log("INFO", "LLM context length exceeded", {"response": text[:300]})
+                raise ContextLengthExceeded(text[:500])
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                raise _LLMTransportError(f"API returned {resp.status_code}")
+            exit_with_error(
+                f"LLM API returned {resp.status_code}",
+                {"status_code": resp.status_code, "response": text[:500], "model": config["MODEL"]}
+            )
+
+        ttfb = None
+        finish_reason = ""
+        parts = []
+        try:
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line or raw_line.startswith(":"):
                     continue
@@ -1131,9 +1145,107 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
                 fr = choices[0].get("finish_reason")
                 if fr:
                     finish_reason = fr
-                if time.monotonic() - start > wall_clock_timeout:
-                    raise _LLMWallClockTimeout()
-            content = "".join(parts)
+                if time.monotonic() - start > LLM_WALL_CLOCK_TIMEOUT_S:
+                    raise _LLMTransportError(f"no response within {LLM_WALL_CLOCK_TIMEOUT_S}s")
+        except requests.exceptions.RequestException as e:
+            raise _LLMTransportError(str(e)) from e
+        return "".join(parts), finish_reason, ttfb
+    finally:
+        if resp is not None:
+            resp.close()
+
+
+# --safe-mode drops CLAUDE.md, skills, plugins, hooks and MCP servers, none of
+# which this prompt wants, and leaves subscription auth working. --bare goes
+# further but forces ANTHROPIC_API_KEY, which defeats the point of running
+# through the CLI at all.
+CLAUDE_CLI_ARGS = [
+    "-p",
+    "--safe-mode",
+    "--strict-mcp-config",
+    "--tools", "",
+    "--no-session-persistence",
+    "--output-format", "json",
+]
+
+
+def _call_claude_cli(config, system_prompt, user_content, start):
+    """Run the Claude Code CLI non-interactively.
+
+    Returns (content, finish_reason, ttfb).
+    """
+    cmd = ["claude", *CLAUDE_CLI_ARGS, "--model", config["MODEL"],
+           "--system-prompt", system_prompt]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=user_content.encode(),
+            capture_output=True,
+            timeout=LLM_WALL_CLOCK_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise _LLMTransportError(f"claude cli timed out after {LLM_WALL_CLOCK_TIMEOUT_S}s") from e
+    except FileNotFoundError:
+        exit_with_error(
+            "claude cli not found on PATH",
+            {"provider": PROVIDER_CLAUDE}
+        )
+
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    # The CLI reports its own failures as a JSON envelope on stdout, so parse
+    # before deciding what went wrong. stderr is usually empty.
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        detail = (stderr or stdout).strip()[:300]
+        raise _LLMTransportError(f"claude cli exited {result.returncode}: {detail}")
+
+    if result.returncode != 0 or envelope.get("is_error"):
+        detail = str(envelope.get("result") or stderr).strip()[:300]
+        if "prompt is too long" in detail.lower():
+            log("INFO", "LLM context length exceeded", {"detail": detail})
+            raise ContextLengthExceeded(detail)
+        status = envelope.get("api_error_status")
+        if status and status not in RETRYABLE_STATUS_CODES:
+            exit_with_error(
+                f"claude cli failed: {detail}",
+                {"api_error_status": status, "model": config["MODEL"]}
+            )
+        raise _LLMTransportError(detail or f"claude cli exited {result.returncode}")
+
+    ttft_ms = envelope.get("ttft_ms")
+    ttfb = ttft_ms / 1000 if ttft_ms else None
+    # The rest of this module speaks OpenAI's name for truncation.
+    finish_reason = "length" if envelope.get("stop_reason") == "max_tokens" else ""
+    return envelope.get("result", ""), finish_reason, ttfb
+
+
+PROVIDER_CALLERS = {
+    PROVIDER_OPENROUTER: _call_openrouter,
+    PROVIDER_CLAUDE: _call_claude_cli,
+}
+
+
+def call_llm_raw(config, system_prompt, user_content, task_label=None):
+    """Make an LLM call and return parsed JSON.
+
+    Records TTFB where the provider reports it and warns when a single
+    request is unusually slow. ``task_label`` is used in warning messages
+    and logs so it's obvious which group is slow.
+    """
+    call_provider = PROVIDER_CALLERS[config["PROVIDER"]]
+    label = task_label or "llm"
+    content = ""
+    finish_reason = ""
+
+    for attempt in range(MAX_RETRIES):
+        start = time.monotonic()
+        _timings.request_started()
+        try:
+            content, finish_reason, ttfb = call_provider(
+                config, system_prompt, user_content, start
+            )
             duration = time.monotonic() - start
             _timings.request_finished(duration)
             log("INFO", "llm done", {
@@ -1145,7 +1257,7 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
             if duration >= SLOW_LLM_THRESHOLD_S:
                 warn(f"slow LLM response: {label} took {duration:.1f}s")
             break
-        except (_LLMWallClockTimeout, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+        except _LLMTransportError as e:
             _timings.request_finished(time.monotonic() - start)
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2 ** attempt
@@ -1156,9 +1268,6 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
                 f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
                 {"model": config["MODEL"], "attempts": MAX_RETRIES}
             )
-        finally:
-            if resp is not None:
-                resp.close()
 
     content = content.strip()
     if content.startswith("```"):
@@ -1500,7 +1609,8 @@ def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
                 return (idx, "context_exceeded", normalized)
             return (idx, result, normalized)
 
-        with ThreadPoolExecutor(max_workers=min(total_tasks, PHASE2_MAX_PARALLEL)) as executor:
+        max_parallel = PHASE2_MAX_PARALLEL[config["PROVIDER"]]
+        with ThreadPoolExecutor(max_workers=min(total_tasks, max_parallel)) as executor:
             futures = {executor.submit(_phase2_call, t): t for t in llm_tasks}
             for future in as_completed(futures):
                 done_count[0] += 1
@@ -1824,14 +1934,16 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
     parser.add_argument("--no-push", action="store_true", help="skip automatic push")
     parser.add_argument("--bulk", action="store_true", help="skip LLM, use smart file tree analysis (for large batches)")
+    parser.add_argument("--provider", choices=PROVIDERS, default=PROVIDER_OPENROUTER,
+                        help="where to send prompts (default: openrouter)")
     args = parser.parse_args()
 
-    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
+    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk, "provider": args.provider})
     log_git_state()
     _prune_old_logs()
 
-    config = load_config()
-    log("INFO", "using model", {"model": config["MODEL"]})
+    config = load_config(args.provider)
+    log("INFO", "using model", {"provider": config["PROVIDER"], "model": config["MODEL"]})
 
     _, _, rc = run(["git", "rev-parse", "--git-dir"])
     if rc != 0:
