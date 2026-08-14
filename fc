@@ -361,6 +361,15 @@ EXCLUDED_PATTERNS = [
     "*.map",
 ]
 
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_CLAUDE = "claude"
+PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_CLAUDE)
+
+# Used when the config sets no CLAUDE_MODEL. Haiku is the cheapest model that
+# handles this task, and the claude provider spends a seat's Agent SDK credit
+# rather than metered API billing.
+CLAUDE_DEFAULT_MODEL = "haiku"
+
 SCOPE_GUIDANCE = (
     "Scope MUST reflect the project or module, NOT the leaf filename. "
     "Derive it from the file paths: in monorepos where top-level dirs are containers "
@@ -372,29 +381,60 @@ SCOPE_GUIDANCE = (
     "Always include a scope — omit only for truly root-level config files."
 )
 
+# The same rules without the worked examples, which produced identical scopes
+# on a smaller prompt.
+SCOPE_GUIDANCE_TERSE = (
+    "Scope is the project or module taken from the file path, never the filename. "
+    "Under a container dir (apps/ packages/ libs/ services/ crates/ cmd/ tools/) use the "
+    "2nd path component, otherwise the first directory. "
+    "Omit the scope only for truly root-level config files."
+)
+
 DESCRIPTION_GUIDANCE = (
     "The description is the commit body. It must explain WHAT changed and WHY, not just restate the subject. "
     "Cover: what behavior/logic changed, why the change was needed, and any non-obvious consequences. "
     "Use 1-4 concise sentences. Never leave it empty or repeat the subject line."
 )
 
-SYSTEM_PROMPT = f"""Group git diff into atomic commits. Every file MUST appear in exactly one commit.
-Output JSON array: [{{"files":["path/to/file"],"message":"type(scope): subject","description":"commit body"}}]
-Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
-{SCOPE_GUIDANCE}
-{DESCRIPTION_GUIDANCE}
-Use REAL file paths from the diff and REAL commit messages. Output ONLY valid JSON, no markdown."""
-
 PHASE1_PROMPT = """Group changed files into logical atomic commits by analyzing file paths and change types.
 Output JSON array: [{"files":["path/to/file"],"hint":"what changed"}]
 Use REAL file paths from the list below. Output ONLY valid JSON, no markdown."""
 
-PHASE2_PROMPT = f"""Generate ONE commit message for this diff.
+
+def _build_prompts(scope_guidance, description_guidance):
+    return {
+        "system": f"""Group git diff into atomic commits. Every file MUST appear in exactly one commit.
+Output JSON array: [{{"files":["path/to/file"],"message":"type(scope): subject","description":"commit body"}}]
+Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
+{scope_guidance}
+{description_guidance}
+Use REAL file paths from the diff and REAL commit messages. Output ONLY valid JSON, no markdown.""",
+        "phase2": f"""Generate ONE commit message for this diff.
 Output JSON object: {{"message":"type(scope): subject","description":"commit body"}}
 Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
-{SCOPE_GUIDANCE}
-{DESCRIPTION_GUIDANCE}
-Output ONLY valid JSON, no markdown."""
+{scope_guidance}
+{description_guidance}
+Output ONLY valid JSON, no markdown.""",
+        # No description field at all. Used where the phase 1 hint already
+        # describes the group, so there is nothing to pay a model to write.
+        "phase2_subject": f"""Generate ONE commit subject for this diff.
+Output JSON object: {{"message":"type(scope): subject"}}
+Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
+{scope_guidance}
+Output ONLY valid JSON, no markdown.""",
+        "retry": f"""Previous output was rejected. Use REAL file paths from the diff and REAL commit messages.
+Every file MUST appear in exactly one commit.
+{scope_guidance}
+{description_guidance}
+Output ONLY valid JSON array:
+[{{"files":["real/path.go"],"message":"feat(scope): real subject","description":"what changed and why"}}]""",
+    }
+
+
+PROMPTS = {
+    PROVIDER_OPENROUTER: _build_prompts(SCOPE_GUIDANCE, DESCRIPTION_GUIDANCE),
+    PROVIDER_CLAUDE: _build_prompts(SCOPE_GUIDANCE_TERSE, DESCRIPTION_GUIDANCE),
+}
 
 # Directories that are monorepo containers — scope should be the child (project name)
 CONTAINER_DIRS = {"apps", "packages", "libs", "services", "crates", "cmd", "tools"}
@@ -462,16 +502,6 @@ def compute_path_context(file_paths):
 # ---------------------------------------------------------------------------
 # Config + git helpers
 # ---------------------------------------------------------------------------
-
-PROVIDER_OPENROUTER = "openrouter"
-PROVIDER_CLAUDE = "claude"
-PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_CLAUDE)
-
-# Used when the config sets no CLAUDE_MODEL. Haiku is the cheapest model that
-# handles this task, and the claude provider spends a seat's Agent SDK credit
-# rather than metered API billing.
-CLAUDE_DEFAULT_MODEL = "haiku"
-
 
 def load_config(provider):
     if not CONFIG_PATH.exists():
@@ -541,6 +571,38 @@ def strip_diff_noise(diff):
         line for line in diff.splitlines()
         if not line.startswith(_DIFF_NOISE_PREFIXES)
     )
+
+
+_DIFF_META_PREFIXES = ("rename ", "new file", "deleted file", "old mode", "new mode")
+
+
+def strip_diff_context(diff):
+    """Drop unified-diff context lines and the redundant ---/+++ header pair.
+
+    Keeps the `diff --git` line, so file identity survives, plus hunk headers,
+    every changed line and the rename/create/delete metadata. Only the copy
+    sent to a model goes through this; everything that parses a diff for file
+    paths or operations reads the original.
+
+    Header and hunk body are tracked separately because a removed line can
+    itself start with `---`, which is common in YAML and markdown. Inside a
+    hunk every line is content, so there is nothing to disambiguate.
+    """
+    kept = []
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            in_hunk = False
+            kept.append(line)
+        elif line.startswith("@@"):
+            in_hunk = True
+            kept.append(line)
+        elif not in_hunk:
+            if line.startswith(_DIFF_META_PREFIXES):
+                kept.append(line)
+        elif line.startswith(("+", "-")):
+            kept.append(line)
+    return "\n".join(kept)
 
 
 def get_diff():
@@ -989,6 +1051,15 @@ def compress_diff(diff, max_chars=None):
     return "\n".join(parts)
 
 
+def prepare_diff_for_llm(config, diff, max_chars=None):
+    """Shrink a diff down to what a model needs to read."""
+    if config["PROVIDER"] == PROVIDER_CLAUDE:
+        diff = strip_diff_context(diff)
+    if len(diff) <= MAX_DIFF_CHARS:
+        return diff
+    return compress_diff(diff, max_chars=max_chars)
+
+
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 
@@ -1298,14 +1369,6 @@ def call_llm_raw(config, system_prompt, user_content, task_label=None):
     return []
 
 
-RETRY_PROMPT = f"""Previous output was rejected. Use REAL file paths from the diff and REAL commit messages.
-Every file MUST appear in exactly one commit.
-{SCOPE_GUIDANCE}
-{DESCRIPTION_GUIDANCE}
-Output ONLY valid JSON array:
-[{{"files":["real/path.go"],"message":"feat(scope): real subject","description":"what changed and why"}}]"""
-
-
 def is_malformed_response(result):
     """Check if response is clearly malformed (key echoing or invalid structure)."""
     if not isinstance(result, list):
@@ -1336,7 +1399,8 @@ def call_llm(config, diff, missing_hint=None, staged_files=None):
     missing_hint: set of file paths the LLM missed on a previous attempt.
     staged_files: dict of staged file paths (used for path context).
     """
-    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    prompts = PROMPTS[config["PROVIDER"]]
+    content = prepare_diff_for_llm(config, diff)
     path_ctx = compute_path_context(staged_files.keys()) if staged_files else ""
     if path_ctx:
         content = path_ctx + "\n" + content
@@ -1344,13 +1408,13 @@ def call_llm(config, diff, missing_hint=None, staged_files=None):
         hint_line = "IMPORTANT: You previously missed these files — they MUST be included: " + ", ".join(sorted(missing_hint))
         content = hint_line + "\n\n" + content
     log("INFO", "sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
-    result = call_llm_raw(config, SYSTEM_PROMPT, content, task_label="single-shot")
+    result = call_llm_raw(config, prompts["system"], content, task_label="single-shot")
     result = normalize_llm_result(result)
 
     if is_malformed_response(result):
         warn("response looks malformed, retrying with stronger prompt")
         retry_content = compress_diff(diff) if len(diff) > MAX_DIFF_CHARS // 2 else content
-        result = call_llm_raw(config, RETRY_PROMPT, retry_content, task_label="single-shot-retry")
+        result = call_llm_raw(config, prompts["retry"], retry_content, task_label="single-shot-retry")
         result = normalize_llm_result(result)
 
     return result
@@ -1489,6 +1553,19 @@ def _smart_fallback_commits(normalized, staged_files):
     return []
 
 
+def _phase2_plan(config, n_files, hint):
+    """Pick the phase 2 prompt, plus the body to use if the model writes none.
+
+    A one-file group gets the subject-only prompt on claude. Writing the body
+    is most of the cost of a call there, and phase 1 already described the
+    group, so its hint becomes the body instead.
+    """
+    prompts = PROMPTS[config["PROVIDER"]]
+    if config["PROVIDER"] == PROVIDER_CLAUDE and n_files == 1:
+        return prompts["phase2_subject"], hint
+    return prompts["phase2"], ""
+
+
 def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
     """Two-phase approach for large diffs with many files.
 
@@ -1564,12 +1641,13 @@ def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
         if not group_diff.strip():
             continue
 
-        max_group_chars = 30000
-        content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff, max_chars=max_group_chars)
+        content = prepare_diff_for_llm(config, group_diff, max_chars=30000)
         group_ctx = compute_path_context(normalized)
         if group_ctx:
             content = group_ctx + "\n" + content
-        llm_tasks.append((i, normalized, content))
+        hint = group.get("hint") if isinstance(group.get("hint"), str) else ""
+        prompt, fallback_description = _phase2_plan(config, len(normalized), hint)
+        llm_tasks.append((i, normalized, content, prompt, fallback_description))
 
     # Run all phase 2 LLM calls in parallel
     if llm_tasks:
@@ -1599,22 +1677,22 @@ def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
             _spinner.set_dynamic(_phase2_msg)
 
         def _phase2_call(task):
-            idx, normalized, content = task
+            idx, normalized, content, prompt, fallback_description = task
             log("INFO", "phase 2: sending diff to LLM", {"group": idx + 1, "chars": len(content), "files": len(normalized)})
             try:
                 result = call_llm_raw(
-                    config, PHASE2_PROMPT, content, task_label=f"group {idx + 1}"
+                    config, prompt, content, task_label=f"group {idx + 1}"
                 )
             except ContextLengthExceeded:
-                return (idx, "context_exceeded", normalized)
-            return (idx, result, normalized)
+                return (idx, "context_exceeded", normalized, fallback_description)
+            return (idx, result, normalized, fallback_description)
 
         max_parallel = PHASE2_MAX_PARALLEL[config["PROVIDER"]]
         with ThreadPoolExecutor(max_workers=min(total_tasks, max_parallel)) as executor:
             futures = {executor.submit(_phase2_call, t): t for t in llm_tasks}
             for future in as_completed(futures):
                 done_count[0] += 1
-                idx, result, normalized = future.result()
+                idx, result, normalized, fallback_description = future.result()
 
                 if result == "context_exceeded":
                     warn(f"context length exceeded for group {idx + 1}, using smart analysis")
@@ -1640,6 +1718,8 @@ def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
                 description = result.get("description", "")
                 if description.lower() == "description":
                     description = ""
+                if not description:
+                    description = fallback_description
 
                 commits.append((idx, _ensure_grounded_scope({"files": normalized, "message": _clean_commit_message(message), "description": description})))
 

@@ -19,6 +19,8 @@ is_lockfile = _mod.is_lockfile
 is_binary_path = _mod.is_binary_path
 git_unquote = _mod.git_unquote
 strip_diff_noise = _mod.strip_diff_noise
+strip_diff_context = _mod.strip_diff_context
+_phase2_plan = _mod._phase2_plan
 extract_diff_path = _mod.extract_diff_path
 try_repair_json = _mod.try_repair_json
 normalize_llm_files = _mod.normalize_llm_files
@@ -192,6 +194,83 @@ class TestStripDiffNoise:
 
     def test_empty_input(self):
         assert strip_diff_noise("") == ""
+
+
+# ---------------------------------------------------------------------------
+# strip_diff_context
+# ---------------------------------------------------------------------------
+
+class TestStripDiffContext:
+    DIFF = (
+        "diff --git a/f.py b/f.py\n"
+        "--- a/f.py\n"
+        "+++ b/f.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        " def handler():\n"
+        "-    return old()\n"
+        "+    return new()\n"
+        " # trailing context\n"
+    )
+
+    def test_drops_context_and_header_pair(self):
+        assert strip_diff_context(self.DIFF).splitlines() == [
+            "diff --git a/f.py b/f.py",
+            "@@ -1,4 +1,4 @@",
+            "-    return old()",
+            "+    return new()",
+        ]
+
+    def test_keeps_changed_lines_starting_with_dashes(self):
+        # A YAML separator being removed looks exactly like a file header.
+        diff = (
+            "diff --git a/c.yaml b/c.yaml\n"
+            "--- a/c.yaml\n"
+            "+++ b/c.yaml\n"
+            "@@ -1,2 +1,2 @@\n"
+            "----\n"
+            "+++new\n"
+        )
+        assert strip_diff_context(diff).splitlines() == [
+            "diff --git a/c.yaml b/c.yaml",
+            "@@ -1,2 +1,2 @@",
+            "----",
+            "+++new",
+        ]
+
+    def test_keeps_file_operation_metadata(self):
+        diff = "diff --git a/a b/b\nsimilarity index 95%\nrename from a\nrename to b\n"
+        result = strip_diff_context(diff)
+        assert "rename from a" in result
+        assert "rename to b" in result
+        assert "similarity index" not in result
+
+    def test_empty_input(self):
+        assert strip_diff_context("") == ""
+
+
+# ---------------------------------------------------------------------------
+# _phase2_plan
+# ---------------------------------------------------------------------------
+
+class TestPhase2Plan:
+    CLAUDE = {"PROVIDER": _mod.PROVIDER_CLAUDE}
+    OPENROUTER = {"PROVIDER": _mod.PROVIDER_OPENROUTER}
+
+    def test_claude_single_file_asks_for_subject_only(self):
+        prompt, fallback = _phase2_plan(self.CLAUDE, 1, "tightened the retry budget")
+        assert "description" not in prompt
+        assert fallback == "tightened the retry budget"
+
+    def test_claude_multi_file_asks_for_a_description(self):
+        prompt, fallback = _phase2_plan(self.CLAUDE, 2, "tightened the retry budget")
+        assert "description" in prompt
+        assert fallback == ""
+
+    def test_openrouter_never_substitutes_the_hint(self):
+        for n_files in (1, 2):
+            prompt, fallback = _phase2_plan(self.OPENROUTER, n_files, "a hint")
+            assert "description" in prompt
+            assert fallback == ""
 
 
 # ---------------------------------------------------------------------------
