@@ -65,6 +65,7 @@ fastc --dry-run      # preview commits without executing
 fastc --no-push      # commit but don't push
 fastc --no-verify    # bypass pre-commit hooks
 fastc --bulk         # skip LLM, use smart file tree analysis
+fastc --provider claude   # route prompts through the Claude Code CLI
 ```
 
 The tool will:
@@ -78,9 +79,32 @@ The tool will:
 
 | Variable | Description |
 |----------|-------------|
-| `OPENROUTER_API_KEY` | Your OpenRouter API key (required) |
-| `MODEL` | Model to use (required). Any model on OpenRouter works. |
+| `OPENROUTER_API_KEY` | Your OpenRouter API key (required for the default provider) |
+| `MODEL` | Model to use (required for the default provider). Any model on OpenRouter works. |
 | `STRUCTURED_OUTPUT` | Set to `false` to disable JSON mode (default: `true`) |
+| `CLAUDE_MODEL` | Model for `--provider claude` (default: `haiku`) |
+
+## Providers
+
+`fastc` talks to OpenRouter over HTTP. `fastc --provider claude` shells out to the
+Claude Code CLI instead, which sends nothing to a third party and needs no API
+key, because it spends the Agent SDK credit attached to a Claude subscription.
+
+Install the CLI from [claude.com/code](https://claude.com/code) and log in with
+`claude` once. The prompt runs with `--safe-mode`, so repo `CLAUDE.md` files,
+skills, plugins, hooks and MCP servers are all ignored.
+
+It is much slower: tens of seconds per request against 2 to 3 for a fast
+OpenRouter model. The model thinks before answering, that cannot be turned off
+through the CLI, and how long it thinks varies by up to 9x between identical
+runs. Each request is also a process holding about 450MB, so phase 2 runs 4 at
+a time rather than 32.
+
+To keep the prompt small the claude path strips context lines from the diff,
+which cuts it by roughly a quarter, and uses a shorter form of the scope rules.
+Phase 2 asks for a subject only when a group holds a single file, and reuses
+that group's phase 1 hint as the commit body. Commit messages themselves are
+the same shape on both providers.
 
 ### Recommended models
 

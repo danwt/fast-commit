@@ -22,12 +22,14 @@ fastc --dry-run      # preview commits without executing
 fastc --no-push      # commit but don't push
 fastc --no-verify    # bypass pre-commit hooks
 fastc --bulk         # skip LLM, use smart file tree analysis
+fastc --provider claude   # route prompts through the Claude Code CLI
 ```
 
 ## Prerequisites
 
 - `uv` must be installed
 - `~/.config/fast-commit/.env` must exist with `OPENROUTER_API_KEY` and `MODEL` set
+- `--provider claude` needs neither of those, but does need the `claude` CLI on PATH and logged in
 - The current directory must be a git repo with uncommitted changes
 
 ## What it does
@@ -35,7 +37,7 @@ fastc --bulk         # skip LLM, use smart file tree analysis
 1. Detects staged or unstaged changes
 2. Excludes lockfiles from analysis (commits them separately)
 3. For large diffs (15+ files), uses two-phase grouping approach
-4. Sends diff to LLM via OpenRouter
+4. Sends diff to an LLM, via OpenRouter or the Claude Code CLI
 5. Creates atomic commits with conventional commit messages
 6. Pushes to the remote
 
