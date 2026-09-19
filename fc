@@ -27,9 +27,10 @@ import truststore
 # root CA there, and certifi's bundle does not have it.
 truststore.inject_into_ssl()
 
-CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
-LOGS_DIR = Path.home() / ".fastc" / "logs"
-AUDIT_LOG = Path.home() / ".fastc" / "audit.jsonl"
+CONFIG_DIR = Path.home() / ".config" / "fast-commit"
+CONFIG_PATH = CONFIG_DIR / ".env"
+LOGS_DIR = CONFIG_DIR / "logs"
+AUDIT_LOG = CONFIG_DIR / "audit.jsonl"
 
 # Session log file - created once per run
 _session_log = None
@@ -1983,7 +1984,7 @@ def audit_remaining(staged_files, lockfiles, failed_commits):
     all_remaining = set(remaining["staged"]) | set(remaining["unstaged"]) | set(remaining["untracked"])
     missed_from_run = all_remaining & run_scope
     if missed_from_run:
-        warn(f"{len(missed_from_run)} files from this run still uncommitted (check ~/.fastc/audit.jsonl)")
+        warn(f"{len(missed_from_run)} files from this run still uncommitted (check {AUDIT_LOG})")
 
 
 def push_to_remote():
