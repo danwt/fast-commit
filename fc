@@ -397,9 +397,10 @@ DESCRIPTION_GUIDANCE = (
     "Use 1-4 concise sentences. Never leave it empty or repeat the subject line."
 )
 
-PHASE1_PROMPT = """Group changed files into logical atomic commits by analyzing file paths and change types.
-Output JSON array: [{"files":["path/to/file"],"hint":"what changed"}]
-Use REAL file paths from the list below. Output ONLY valid JSON, no markdown."""
+PHASE1_PROMPT = """Group numbered change units into logical atomic commits by their paths and change types.
+A unit is a file, or a directory ending in "/". Status letters: A added, M modified, D deleted, R renamed.
+Output JSON array: [{"ids":[1,2],"hint":"what changed"}]
+Use every unit id exactly once. Output ONLY valid JSON, no markdown."""
 
 
 def _build_prompts(scope_guidance, description_guidance):
@@ -663,12 +664,13 @@ PHASE2_MAX_PARALLEL = {
 }
 # Warn the user if a single LLM request takes longer than this many seconds.
 SLOW_LLM_THRESHOLD_S = 15.0
-# Beyond this many files, skip LLM entirely and use bulk commit
-BULK_FILE_THRESHOLD = 200
-# Maximum characters for phase 1 file summary before fallback
-MAX_PHASE1_CHARS = 50000
-# LLM retry attempts when files are missed
-MAX_LLM_RETRIES = 3
+# Phase 1 sees at most this many units, collapsing files into directories
+# beyond it, so its answer stays well under MAX_OUTPUT_TOKENS.
+PHASE1_MAX_UNITS = 40
+# File names listed per directory unit in phase 1.
+PHASE1_SAMPLE_NAMES = 6
+# Files the single-shot answer missed are committed in at most this many groups.
+MISSED_MAX_UNITS = 5
 
 BINARY_EXTENSIONS = {
     '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
@@ -1410,20 +1412,13 @@ def normalize_llm_result(result):
     return []
 
 
-def call_llm(config, diff, missing_hint=None, staged_files=None):
-    """Single-phase: send diff and get commits.
-
-    missing_hint: set of file paths the LLM missed on a previous attempt.
-    staged_files: dict of staged file paths (used for path context).
-    """
+def call_llm(config, diff, staged_files):
+    """Single-phase: send diff and get commits."""
     prompts = PROMPTS[config["PROVIDER"]]
     content = prepare_diff_for_llm(config, diff)
-    path_ctx = compute_path_context(staged_files.keys()) if staged_files else ""
+    path_ctx = compute_path_context(staged_files.keys())
     if path_ctx:
         content = path_ctx + "\n" + content
-    if missing_hint:
-        hint_line = "IMPORTANT: You previously missed these files — they MUST be included: " + ", ".join(sorted(missing_hint))
-        content = hint_line + "\n\n" + content
     log("INFO", "sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
     result = call_llm_raw(config, prompts["system"], content, task_label="single-shot")
     result = normalize_llm_result(result)
@@ -1583,86 +1578,165 @@ def _phase2_plan(config, n_files, hint):
     return prompts["phase2"], ""
 
 
-def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
+def build_units(paths, max_units=PHASE1_MAX_UNITS):
+    """Collapse paths into at most ``max_units`` units, merging the deepest
+    directories first. Returns sorted [(label, files)]; directory labels end in "/".
+    """
+    units = {tuple(p.split("/")): [p] for p in paths}
+    while len(units) > max_units:
+        depth = max(len(k) for k in units)
+        if depth <= 1:
+            break
+        merged = defaultdict(list)
+        for key, files in units.items():
+            merged[key[:-1] if len(key) == depth else key].extend(files)
+        units = merged
+    result = []
+    for key, files in units.items():
+        label = "/".join(key)
+        if files != [label]:
+            label += "/"
+        result.append((label, sorted(files)))
+    return sorted(result)
+
+
+def _file_change(path, section, staged_files):
+    """Return (status letter, lines added, lines removed) for one staged file."""
+    lines = section.splitlines()
+    added = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    info = staged_files[path]
+    if info["deleted"]:
+        status = "D"
+    elif info["old"] != path:
+        status = "R"
+    else:
+        status = "A" if "\nnew file mode" in section else "M"
+    return status, added, removed
+
+
+def describe_units(units, diff_by_file, staged_files):
+    """Render numbered units for phase 1, one line each."""
+    lines = []
+    for i, (label, files) in enumerate(units, 1):
+        changes = [_file_change(f, diff_by_file.get(f, ""), staged_files) for f in files]
+        added = sum(c[1] for c in changes)
+        removed = sum(c[2] for c in changes)
+        if not label.endswith("/"):
+            lines.append(f"{i}. {changes[0][0]} {label} +{added} -{removed}")
+            continue
+        statuses = defaultdict(int)
+        for c in changes:
+            statuses[c[0]] += 1
+        counts = " ".join(f"{s}{n}" for s, n in sorted(statuses.items()))
+        names = ", ".join(f[len(label):] for f in files[:PHASE1_SAMPLE_NAMES])
+        if len(files) > PHASE1_SAMPLE_NAMES:
+            names += ", ..."
+        lines.append(f"{i}. {label} {len(files)} files ({counts}) +{added} -{removed}: {names}")
+    return "\n".join(lines)
+
+
+def _shared_depth(a, b):
+    """Number of leading path components ``a`` and ``b`` share."""
+    n = 0
+    for x, y in zip(a.split("/"), b.split("/")):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def groups_from_unit_ids(raw, units):
+    """Turn phase 1's [{"ids", "hint"}] into [{"files", "hint"}].
+
+    Each unit goes to the first group naming it. A unit no group names joins
+    the group sharing the longest path prefix with it, or else becomes its own
+    group, so a short or truncated answer never forces another round trip.
+    """
+    groups = []
+    taken = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        files = []
+        for uid in item.get("ids") or []:
+            try:
+                idx = int(uid) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(units) and idx not in taken:
+                taken.add(idx)
+                files.extend(units[idx][1])
+        if files:
+            hint = item.get("hint")
+            groups.append({"files": files, "hint": hint if isinstance(hint, str) else ""})
+
+    leftovers = [units[i] for i in range(len(units)) if i not in taken]
+    if leftovers:
+        log("INFO", "phase 1 left units unassigned", {"units": [label for label, _ in leftovers]})
+    for label, files in leftovers:
+        best, best_depth = None, 0
+        for group in groups:
+            depth = max(_shared_depth(label, f) for f in group["files"])
+            if depth > best_depth:
+                best, best_depth = group, depth
+        if best:
+            best["files"].extend(files)
+        else:
+            groups.append({"files": list(files), "hint": ""})
+    return groups
+
+
+def call_llm_two_phase(config, diff, staged_files):
     """Two-phase approach for large diffs with many files.
 
-    ``diff`` is the already-computed unified diff; we parse it once into a
-    per-file cache so phase-2 group slicing is an in-memory dict lookup
-    instead of re-running ``git diff`` per group.
+    Phase 1 groups numbered units (files, or directories once there are many)
+    and answers with unit ids, so its output stays small however many files
+    are staged. Phase 2 writes one message per group in parallel.
     """
-    excludes = build_pathspec_excludes()
-    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--", "."] + excludes)
-    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
     diff_by_file = parse_diff_by_file(diff)
+    units = build_units(staged_files)
+    phase1_content = (
+        compute_path_context(staged_files.keys())
+        + "UNITS:\n"
+        + describe_units(units, diff_by_file, staged_files)
+    )
+    log("INFO", "phase 1: sending units to LLM", {"chars": len(phase1_content), "units": len(units)})
+    if _spinner:
+        _spinner.set(f"Grouping {len(staged_files)} files as {len(units)} units")
+    try:
+        raw = call_llm_raw(config, PHASE1_PROMPT, phase1_content, task_label="phase1-grouping")
+    except ContextLengthExceeded:
+        warn("LLM context length exceeded, falling back to directory grouping")
+        return group_files_by_directory(staged_files)
+    if isinstance(raw, dict):
+        raw = raw.get("groups", raw.get("commits", []))
+    return write_commit_messages(config, groups_from_unit_ids(raw, units), diff_by_file, staged_files)
 
-    path_ctx = compute_path_context(staged_files.keys())
-    phase1_content = f"{path_ctx}FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
-    if missing_hint:
-        hint_line = "IMPORTANT: You previously missed these files — include ALL of them: " + ", ".join(sorted(missing_hint))
-        phase1_content = hint_line + "\n\n" + phase1_content
 
-    if len(phase1_content) > MAX_PHASE1_CHARS:
-        warn(f"file summary too large ({len(phase1_content)} chars), grouping by directory instead")
-        log("INFO", "skipping LLM phase 1 due to size", {"chars": len(phase1_content)})
-        groups = group_files_by_directory(staged_files)
-    else:
-        log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
-        if _spinner:
-            _spinner.set(f"Grouping files ({len(staged_files)})")
-        try:
-            groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content, task_label="phase1-grouping")
-        except ContextLengthExceeded:
-            warn("LLM context length exceeded, falling back to directory grouping")
-            groups = group_files_by_directory(staged_files)
-
-    if isinstance(groups, dict):
-        groups = groups.get("groups", groups.get("commits", []))
-
-    if not isinstance(groups, list):
-        warn(f"phase 1 returned non-list ({type(groups).__name__}), using smart grouping")
-        groups = group_files_by_directory(staged_files)
-
-    if not groups:
-        groups = group_files_by_directory(staged_files)
-
-    # Separate groups that already have messages from those needing LLM
+def write_commit_messages(config, groups, diff_by_file, staged_files):
+    """Phase 2: write one commit message per group of files, in parallel."""
     commits = []
-    llm_tasks = []  # (index, normalized_files)
+    llm_tasks = []
 
     for i, group in enumerate(groups):
-        if not isinstance(group, dict):
-            continue
-        files = group.get("files", [])
-        if not files:
-            continue
-
-        if group.get("message"):
-            normalized = normalize_llm_files(files, staged_files) if isinstance(files[0], str) else files
-            if normalized:
-                commits.append((i, {
-                    "files": normalized,
-                    "message": group["message"],
-                    "description": group.get("description", ""),
-                }))
-            continue
-
-        normalized = normalize_llm_files(files, staged_files)
-        if not normalized:
-            continue
-
+        normalized = group["files"]
         group_diff = slice_diff_by_file(diff_by_file, normalized)
         if not group_diff.strip():
             # Fall back to shelling out if the file wasn't in the parsed
             # cache (e.g. encoding edge cases). Rare.
             group_diff = get_diff_for_files(normalized)
         if not group_diff.strip():
+            commits.extend((i, c) for c in _smart_fallback_commits(normalized, staged_files))
             continue
 
         content = prepare_diff_for_llm(config, group_diff, max_chars=30000)
         group_ctx = compute_path_context(normalized)
         if group_ctx:
             content = group_ctx + "\n" + content
-        hint = group.get("hint") if isinstance(group.get("hint"), str) else ""
+        hint = group.get("hint", "")
+        if hint:
+            content = f"GROUP INTENT: {hint}\n" + content
         prompt, fallback_description = _phase2_plan(config, len(normalized), hint)
         llm_tasks.append((i, normalized, content, prompt, fallback_description))
 
@@ -1816,45 +1890,29 @@ def generate_commit_plan(config, args, diff, staged_files):
     """Generate commit plan via LLM or bulk analysis. Returns list of commits."""
     file_count = len(staged_files)
 
-    if args.bulk or file_count > BULK_FILE_THRESHOLD:
-        mode = "--bulk flag" if args.bulk else f"{file_count} files"
-        _spinner.set(f"Grouping files ({mode})...")
+    if args.bulk:
+        _spinner.set("Grouping files (--bulk flag)...")
         commits = group_files_by_directory(staged_files)
         _spinner.ok(f"Planned {len(commits)} commit{'s' if len(commits) != 1 else ''} (bulk)")
         return commits
 
-    missing_hint = None
-    commits = None
-
-    for attempt in range(1, MAX_LLM_RETRIES + 1):
-        if file_count > LARGE_DIFF_FILES:
-            _spinner.set(f"Grouping files ({file_count})")
-            raw_commits = call_llm_two_phase(config, diff, staged_files, missing_hint=missing_hint)
-        else:
-            label = f"Analysing {file_count} files"
-            if attempt > 1:
-                label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
-            _spinner.set(f"{label}...")
-            try:
-                raw_commits = call_llm(config, diff, missing_hint=missing_hint, staged_files=staged_files)
-            except ContextLengthExceeded:
-                warn("diff too large, using bulk mode")
-                return group_files_by_directory(staged_files)
-
-        commits, missing = validate_and_fix_commits(raw_commits, staged_files)
-
-        if not missing:
-            break
-
-        log("INFO", "LLM missed files", {"attempt": attempt, "missed": sorted(missing)})
-
-        if attempt < MAX_LLM_RETRIES:
-            missing_hint = missing
-            warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
-        else:
-            warn(f"LLM missed files after {MAX_LLM_RETRIES} attempts, falling back to bulk mode")
-            log("INFO", "falling back to bulk mode after LLM retry exhaustion", {"missed": sorted(missing)})
+    if file_count > LARGE_DIFF_FILES:
+        raw_commits = call_llm_two_phase(config, diff, staged_files)
+    else:
+        _spinner.set(f"Analysing {file_count} files...")
+        try:
+            raw_commits = call_llm(config, diff, staged_files)
+        except ContextLengthExceeded:
+            warn("diff too large, using bulk mode")
             return group_files_by_directory(staged_files)
+
+    commits, missing = validate_and_fix_commits(raw_commits, staged_files)
+    if missing:
+        # Write commits for just the missed files rather than redoing the plan.
+        log("INFO", "LLM missed files", {"missed": sorted(missing)})
+        warn(f"LLM missed {len(missing)} file(s), writing commits for them separately")
+        groups = [{"files": files} for _, files in build_units(missing, max_units=MISSED_MAX_UNITS)]
+        commits += write_commit_messages(config, groups, parse_diff_by_file(diff), staged_files)
 
     n = len(commits)
     _spinner.ok(f"Planned {n} commit{'s' if n != 1 else ''}")

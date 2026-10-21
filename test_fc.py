@@ -838,3 +838,42 @@ class TestResolveProvider:
 
     def test_no_match_keeps_request(self):
         assert _mod.resolve_provider("openrouter", {"CLAUDE_ONLY_REMOTES": "other"}) == "openrouter"
+
+
+# ---------------------------------------------------------------------------
+# phase 1 units
+# ---------------------------------------------------------------------------
+
+class TestBuildUnits:
+    def test_few_files_stay_files(self):
+        assert _mod.build_units(["a/x.py", "b.py"]) == [("a/x.py", ["a/x.py"]), ("b.py", ["b.py"])]
+
+    def test_collapses_deepest_directories_first(self):
+        paths = [f"app/src/c/{i}.ts" for i in range(5)] + ["app/README.md", "top.md"]
+        assert _mod.build_units(paths, max_units=3) == [
+            ("app/README.md", ["app/README.md"]),
+            ("app/src/c/", sorted(paths[:5])),
+            ("top.md", ["top.md"]),
+        ]
+
+    def test_every_file_lands_in_exactly_one_unit(self):
+        paths = [f"p{i % 7}/d{i % 3}/f{i}.py" for i in range(300)]
+        units = _mod.build_units(paths, max_units=10)
+        assert len(units) <= 10
+        assert sorted(f for _, files in units for f in files) == sorted(paths)
+
+
+class TestGroupsFromUnitIds:
+    UNITS = [("a/", ["a/1", "a/2"]), ("a/b.py", ["a/b.py"]), ("c.py", ["c.py"])]
+
+    def test_maps_ids_to_files(self):
+        groups = _mod.groups_from_unit_ids([{"ids": [1, "2"], "hint": "h"}, {"ids": [3]}], self.UNITS)
+        assert groups == [{"files": ["a/1", "a/2", "a/b.py"], "hint": "h"}, {"files": ["c.py"], "hint": ""}]
+
+    def test_unassigned_unit_joins_nearest_group(self):
+        groups = _mod.groups_from_unit_ids([{"ids": [1]}, {"ids": [3]}], self.UNITS)
+        assert groups[0]["files"] == ["a/1", "a/2", "a/b.py"]
+
+    def test_truncated_answer_still_covers_every_file(self):
+        groups = _mod.groups_from_unit_ids([], self.UNITS)
+        assert sorted(f for g in groups for f in g["files"]) == ["a/1", "a/2", "a/b.py", "c.py"]
